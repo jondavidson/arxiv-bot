@@ -180,3 +180,101 @@ if __name__ == "__main__":
     uni = compute_universe(spec, idx, liq, mcap,
                            start=date(2025, 1, 1), end=date(2025, 12, 31))
     print(uni.df.head())
+
+
+# tooling/introspect.py
+from __future__ import annotations
+import subprocess, re, sys, json, pathlib, shlex
+
+ARG_PAT = re.compile(r"^\\s*(--\\w[\\w-]*)")
+
+def list_args(script_path: str) -> list[str]:
+    """Return list of CLI flags supported by a script (argparse/click/typer)."""
+    try:
+        out = subprocess.check_output(
+            [sys.executable, script_path, "--help"],
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=10,
+        )
+        return ARG_PAT.findall(out)
+    except Exception as exc:
+        print(f"[WARN] {script_path}: {exc}")
+        return []
+
+def crawl_scripts(root="scripts") -> dict[str, list[str]]:
+    mapping: dict[str, list[str]] = {}
+    for p in pathlib.Path(root).rglob("*.py"):
+        mapping[str(p)] = list_args(str(p))
+    return mapping
+
+if __name__ == "__main__":
+    result = crawl_scripts()
+    print(json.dumps(result, indent=2))
+
+
+from dask.distributed import SSHCluster, Client
+from dask import delayed
+
+##############################################################################
+# 1 Create the cluster and connect a client
+##############################################################################
+cluster = SSHCluster(
+    hosts=["host1", "host2"],               # ← replace with real hostnames
+    connect_options={"username": "me"},     # any SSH parameters you need
+    worker_options={"nthreads": 2},         # (optional) per-worker kwargs
+)
+client = Client(cluster)
+
+# Handy: check the canonical addresses the scheduler knows about
+for addr, w in client.scheduler_info()["workers"].items():
+    print(f"{w['name']} → {addr}")
+
+##############################################################################
+# 2 Define a small dependent pipeline with dask.delayed
+##############################################################################
+@delayed
+def task1(x):
+    print("Running task1 on host1")
+    return x + 1
+
+@delayed
+def task2(y):
+    print("Running task2 on host1")
+    return y * 10
+
+@delayed
+def task3(a, b):
+    print("Running task3 on host2")
+    return a + b
+
+# Build the graph
+a  = task1(7)        # host1
+b  = task2(a)        # host1, depends on task1
+out = task3(a, b)    # host2, depends on tasks 1 & 2
+
+##############################################################################
+# 3 Pin each delayed task to its host and compute the final result
+##############################################################################
+workers_map = {
+    a:  "host1",     # could also be 'tcp://host1:8786'
+    b:  "host1",
+    out: "host2",
+}
+
+future = client.compute(out, workers=workers_map)
+result = future.result()
+print("Pipeline result:", result)
+
+
+
+import dask
+
+with dask.annotate(workers="host1"):
+    a = task1(7)
+    b = task2(a)
+
+with dask.annotate(workers="host2"):
+    out = task3(a, b)
+
+result = out.compute()
